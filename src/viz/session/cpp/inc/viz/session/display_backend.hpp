@@ -46,6 +46,13 @@ public:
     {
         return {};
     }
+    // Best-effort device extensions: enabled only when the chosen
+    // physical device advertises them. Query at runtime via
+    // VkContext::has_device_extension().
+    virtual std::vector<std::string> optional_device_extensions() const
+    {
+        return {};
+    }
 
     // Allocate device resources. Throws on failure.
     virtual void init(const VkContext& ctx, Resolution preferred_size) = 0;
@@ -56,6 +63,17 @@ public:
     {
         return false;
     }
+
+    // Number of distinct image slots the backend cycles through.
+    // VizCompositor allocates one FrameSync per slot to enable
+    // multi-frame-in-flight rendering (the host waits on the fence
+    // for the slot it's about to reuse, not on the most recent frame).
+    // Window: swapchain image count (typically 3). XR: XR swapchain
+    // image count (typically 2-3). Offscreen: 1.
+    // The Frame::backend_token returned by begin_frame must be the
+    // slot index (0..image_count()-1) so the compositor can look up
+    // the right fence.
+    virtual uint32_t image_count() const = 0;
 
     struct Frame
     {
@@ -91,11 +109,13 @@ public:
     {
     }
 
-    // Called after a successful submit AND the in-flight fence wait,
-    // so the GPU has finished this frame's command buffer and
-    // signal_after_render is signaled. Safe to vkQueuePresentKHR
-    // here. On any throw between submit and this call, abort_frame
-    // is called instead.
+    // Called after a successful submit. The host has NOT waited on the
+    // in-flight fence (multi-frame-in-flight: that wait happens at the
+    // top of render() for this slot's NEXT use), so the GPU may still
+    // be executing the command buffer. Backends present using
+    // signal_after_render so the WSI orders against GPU completion
+    // without the host needing to block. On any throw between submit
+    // and this call, abort_frame is called instead.
     virtual void end_frame(const Frame& /*frame*/)
     {
     }

@@ -108,11 +108,15 @@ class PolledSource(FrameSource):
             name=name, width=width, height=height, pixel_format="rgba8"
         )
 
-        # Pre-allocate the GPU output (RGBA8) and pinned host staging.
+        # Triple-buffer so the producer never spins waiting for the
+        # consumer's read to clear. QuadLayer::submit synchronizes its
+        # D2D copy before returning, so by the time the producer wraps
+        # back to any slot the consumer is provably done with it; the
+        # third buffer is overlap headroom, not a correctness margin.
         # Alpha is initialised to 255 once; subclasses that don't carry
         # alpha (BGR, GRAY, BGRA) write only the colour channels each frame.
         self._gpu_buffers = [
-            cp.empty((height, width, 4), dtype=cp.uint8) for _ in range(2)
+            cp.empty((height, width, 4), dtype=cp.uint8) for _ in range(3)
         ]
         for buf in self._gpu_buffers:
             buf[..., 3] = 255
@@ -125,7 +129,7 @@ class PolledSource(FrameSource):
         # (which submits on stream 0) sees fully-written GPU data.
         self._stream = cp.cuda.Stream(non_blocking=True)
 
-        # Double-buffer publish state. Producer holds ``_write_idx``; the
+        # Publish state. Producer rotates ``_write_idx`` 0→1→2→0…; the
         # publish→consume handoff goes through ``_publish_idx`` under a lock.
         self._write_idx = 0
         self._publish_idx = -1
@@ -161,8 +165,25 @@ class PolledSource(FrameSource):
     def stop(self) -> None:
         self._stop.set()
         if self._thread is not None:
-            self._thread.join()
+            self._thread.join(timeout=5.0)
+            if self._thread.is_alive():
+                # Thread is wedged inside a subclass _grab() or
+                # _upload_and_convert() that has released the GIL.
+                # Calling _close_device() now would race the live SDK
+                # call (depthai/cv2/zed) — potential native UAF /
+                # driver crash. Leak the device handle instead; the
+                # thread keeps a self-reference via its bound method
+                # so nothing gets freed until it exits.
+                logger.warning(
+                    "%s '%s': producer thread did not exit within 5s; "
+                    "skipping _close_device (SDK handle leaked)",
+                    self._kind,
+                    self._spec.name,
+                )
+                return
             self._thread = None
+
+        # Thread exited cleanly — safe to release the SDK handle.
         if self._connected:
             try:
                 self._close_device()
@@ -286,7 +307,7 @@ class PolledSource(FrameSource):
 
             with self._publish_lock:
                 self._publish_idx = self._write_idx
-            self._write_idx = 1 - self._write_idx
+            self._write_idx = (self._write_idx + 1) % len(self._gpu_buffers)
             self._frame_count += 1
 
     def _mark_disconnected(self) -> None:

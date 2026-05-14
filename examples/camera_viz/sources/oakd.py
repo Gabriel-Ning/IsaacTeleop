@@ -57,16 +57,16 @@ class _StreamSpec:
 
 @dataclass
 class _StreamSlot:
-    """Per-stream double-buffered output + pinned host staging.
+    """Per-stream triple-buffered output + pinned host staging.
 
     Producer thread (one per device) writes into ``gpu_buffers[write_idx]``;
-    consumer (renderer thread) reads via ``latest()``. ``_stream`` is a
+    consumer (renderer thread) reads via ``latest()``. ``cu_stream`` is a
     non-blocking CUDA stream so each stream's H2D + convert can issue
     concurrently with the others on the same producer thread.
     """
 
     spec: _StreamSpec
-    gpu_buffers: list  # 2 × cupy ndarray, HxWx4 RGBA8
+    gpu_buffers: list  # 3 × cupy ndarray, HxWx4 RGBA8 (triple-buffer mailbox)
     host_staging: np.ndarray  # HxW (gray) or HxWx3 (bgr)
     gpu_landing: object  # cupy ndarray matching host_staging shape
     cu_stream: object  # cupy.cuda.Stream
@@ -96,7 +96,7 @@ class _StreamSlot:
     def publish(self) -> None:
         with self.lock:
             self.publish_idx = self.write_idx
-        self.write_idx = 1 - self.write_idx
+        self.write_idx = (self.write_idx + 1) % len(self.gpu_buffers)
 
     def latest(self) -> Optional[Frame]:
         with self.lock:
@@ -168,7 +168,7 @@ class _OakdDevice:
                 staging = alloc_pinned_host((s.height, s.width, 3), np.uint8)
                 landing = cp.empty((s.height, s.width, 3), dtype=cp.uint8)
             gpu_buffers = [
-                cp.empty((s.height, s.width, 4), dtype=cp.uint8) for _ in range(2)
+                cp.empty((s.height, s.width, 4), dtype=cp.uint8) for _ in range(3)
             ]
             for b in gpu_buffers:
                 b[..., 3] = 255

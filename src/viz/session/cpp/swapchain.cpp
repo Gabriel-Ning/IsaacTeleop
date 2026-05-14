@@ -8,6 +8,14 @@
 #include <stdexcept>
 #include <string>
 
+// VK_EXT_present_mode_fifo_latest_ready. Numeric value from the
+// extension spec; we declare it locally instead of pulling in the
+// extension header so the swapchain code stays buildable against
+// older Vulkan SDKs that don't bundle it.
+#ifndef VK_PRESENT_MODE_FIFO_LATEST_READY_EXT
+#    define VK_PRESENT_MODE_FIFO_LATEST_READY_EXT static_cast<VkPresentModeKHR>(1000361000)
+#endif
+
 namespace viz
 {
 
@@ -136,11 +144,23 @@ void Swapchain::init(Resolution preferred_size, VkSwapchainKHR old_swapchain)
         color_space_ = chosen.colorSpace;
         extent_ = clamp_extent(caps, preferred_size);
 
-        // Triple-buffer if the runtime allows it; otherwise the min.
-        uint32_t image_count = caps.minImageCount + 1;
+        // Aim for triple-buffer, but never below caps.minImageCount
+        // (Vulkan spec requires VkSwapchainCreateInfoKHR::minImageCount
+        // >= surface's minImageCount). QuadLayer tracks up to
+        // kMaxFramesInFlight (= 5) in-flight slots, so we refuse to
+        // create swapchains that demand more.
+        constexpr uint32_t kRequestTarget = 3;
+        constexpr uint32_t kMaxAccept = 5; // matches QuadLayer::kMaxFramesInFlight
+        uint32_t image_count = std::max(caps.minImageCount, kRequestTarget);
         if (caps.maxImageCount > 0)
         {
             image_count = std::min(image_count, caps.maxImageCount);
+        }
+        if (image_count > kMaxAccept)
+        {
+            throw std::runtime_error("Swapchain::init: surface requires minImageCount " +
+                                     std::to_string(caps.minImageCount) + " (would create " + std::to_string(image_count) +
+                                     " images), exceeds compositor cap of " + std::to_string(kMaxAccept));
         }
 
         VkSwapchainCreateInfoKHR info{};
@@ -159,8 +179,8 @@ void Swapchain::init(Resolution preferred_size, VkSwapchainKHR old_swapchain)
         info.preTransform = caps.currentTransform;
         info.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
 
-        // Prefer MAILBOX (no compositor sync stalls); FIFO is the
-        // universal fallback. App throttles its own render rate.
+        // Pick present mode per caller preference. FIFO is the universal
+        // fallback (always available per Vulkan spec).
         VkPresentModeKHR present_mode = VK_PRESENT_MODE_FIFO_KHR;
         uint32_t pm_count = 0;
         vkGetPhysicalDeviceSurfacePresentModesKHR(phys, surface_, &pm_count, nullptr);
@@ -169,13 +189,31 @@ void Swapchain::init(Resolution preferred_size, VkSwapchainKHR old_swapchain)
         {
             vkGetPhysicalDeviceSurfacePresentModesKHR(phys, surface_, &pm_count, available_modes.data());
         }
-        for (VkPresentModeKHR m : available_modes)
+        // Preference order: MAILBOX (no tear, no vsync) →
+        // FIFO_LATEST_READY (no tear, vsync-paced but always shows
+        // latest) → FIFO (universal fallback). IMMEDIATE is skipped
+        // because without an acquire-blocks-at-vsync throttle the
+        // event-driven render loop has no natural pacing and the
+        // render thread burns CPU.
+        const auto has_mode = [&available_modes](VkPresentModeKHR m)
         {
-            if (m == VK_PRESENT_MODE_MAILBOX_KHR)
+            for (VkPresentModeKHR avail : available_modes)
             {
-                present_mode = m;
-                break;
+                if (avail == m)
+                    return true;
             }
+            return false;
+        };
+        if (has_mode(VK_PRESENT_MODE_MAILBOX_KHR))
+        {
+            present_mode = VK_PRESENT_MODE_MAILBOX_KHR;
+        }
+        else if (ctx_->has_device_extension("VK_EXT_present_mode_fifo_latest_ready") &&
+                 has_mode(VK_PRESENT_MODE_FIFO_LATEST_READY_EXT))
+        {
+            // Only legal to pass this enum to vkCreateSwapchainKHR when
+            // the extension is enabled; otherwise validation trips.
+            present_mode = VK_PRESENT_MODE_FIFO_LATEST_READY_EXT;
         }
         info.presentMode = present_mode;
         info.clipped = VK_TRUE;
@@ -185,6 +223,14 @@ void Swapchain::init(Resolution preferred_size, VkSwapchainKHR old_swapchain)
 
         uint32_t actual = 0;
         vkGetSwapchainImagesKHR(device, swapchain_, &actual, nullptr);
+        // Spec lets the driver return AT LEAST minImageCount. Accept up
+        // to QuadLayer's tracking cap; reject above that to avoid silent
+        // slot aliasing.
+        if (actual > kMaxAccept)
+        {
+            throw std::runtime_error("Swapchain::init: driver returned " + std::to_string(actual) +
+                                     " swapchain images, exceeding compositor cap of " + std::to_string(kMaxAccept));
+        }
         images_.resize(actual);
         vkGetSwapchainImagesKHR(device, swapchain_, &actual, images_.data());
 

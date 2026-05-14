@@ -16,9 +16,12 @@ namespace viz
 
 class VkContext;
 
-// VkSwapchainKHR + per-image semaphores. Prefers MAILBOX present
-// mode, falls back to FIFO. Surface format prefers B8G8R8A8_SRGB
-// then any *_SRGB then the runtime's first.
+// VkSwapchainKHR + per-image semaphores. Present mode preference:
+// MAILBOX → FIFO_LATEST_READY (only if VK_EXT_present_mode_fifo_latest_ready
+// is enabled) → FIFO. IMMEDIATE is skipped — without an acquire-blocks-
+// at-vsync throttle the event-driven render loop has no natural pacing.
+// Surface format prefers B8G8R8A8_SRGB then any *_SRGB then the
+// runtime's first.
 class Swapchain
 {
 public:

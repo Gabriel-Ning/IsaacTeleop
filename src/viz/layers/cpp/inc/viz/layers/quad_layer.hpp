@@ -27,21 +27,31 @@ class VkContext;
 // (window/offscreen — quad fills the layer's tile) or as a world-space
 // rectangle (kXr — Config::placement required).
 //
-// Mailbox: kSlotCount=3 DeviceImages. submit() picks a slot that's
-// neither the latest publish nor in use, copies pixels in, signals
-// cuda_done_writing, and atomic-exchanges latest. record() exchanges
-// latest into in_use and draws, waiting on the slot's semaphore.
-// Producer never collides with the slot the renderer is sampling;
-// renderer always sees the most recent completed publish.
+// Mailbox: kSlotCount DeviceImages. submit() picks a slot that's
+// neither the latest publish nor in use by any in-flight frame, copies
+// pixels in, signals cuda_done_writing, and atomic-stores latest.
+// record(slot_index) atomic-stores latest into in_use_[slot_index]
+// and draws. Producer never collides with the slot any in-flight
+// renderer is sampling; renderer always sees the most recent
+// completed publish.
 //
-// Correctness depends on VizCompositor::render() being synchronous
-// (single frame in flight). Multi-frame would need per-frame in_use.
+// Sizing invariant: kSlotCount = kMaxFramesInFlight + 2. Worst-case
+// forbidden set is {latest} ∪ in_use_ → 1 + kMaxFramesInFlight distinct
+// values, the +2 leaves at least one free slot. If a backend's
+// image_count ever exceeds kMaxFramesInFlight, record() asserts —
+// bump kMaxFramesInFlight and kSlotCount together.
 //
-// Memory: ~3 × width × height × bpp (24 MB at 1080p RGBA8).
+// Memory: kSlotCount × width × height × bpp (~40 MB at 1080p RGBA8).
 class QuadLayer : public LayerBase
 {
 public:
-    static constexpr uint32_t kSlotCount = 3;
+    // Sized to cover swapchains up to 5 images. The window swapchain
+    // requests <= 3 (see Swapchain::init), but drivers may grant more
+    // than requested; this headroom keeps record() from throwing on
+    // those platforms. Memory cost: kSlotCount × W × H × bpp per layer
+    // (~56 MB at 1080p RGBA8).
+    static constexpr uint32_t kMaxFramesInFlight = 5;
+    static constexpr uint32_t kSlotCount = kMaxFramesInFlight + 2;
 
     struct Config
     {
@@ -77,13 +87,22 @@ public:
     // (one QuadLayer per producer).
     //
     // src.space must be kDevice; dims/format must match the layer.
-    // The copy + cuda_done_writing signal run on `stream` — pass the
-    // producer's stream so the signal lands after its prior writes.
+    // The copy + cuda_done_writing signal run on ``stream``. submit()
+    // BLOCKS on cudaStreamSynchronize(stream) before returning so the
+    // producer can safely reuse src.data — without that wait, a fast
+    // producer wrapping its mailbox could overwrite src.data while our
+    // async memcpy was still reading. Cost: ~0.5 ms per 1080p call on
+    // the calling thread; the render path is unaffected.
     void submit(const VizBuffer& src, cudaStream_t stream = 0);
 
     // Skips the draw before the first submit (slot kSlotNone) — RT
-    // keeps its clear value.
-    void record(VkCommandBuffer cmd, const std::vector<ViewInfo>& views, const RenderTarget& target) override;
+    // keeps its clear value. in_flight_slot identifies which of the
+    // up to kMaxFramesInFlight in-flight frames is being recorded;
+    // this slot's in_use_ entry is updated to the current latest_.
+    void record(VkCommandBuffer cmd,
+                const std::vector<ViewInfo>& views,
+                const RenderTarget& target,
+                uint32_t in_flight_slot) override;
 
     // Timeline wait on the in-use slot's cuda_done_writing.
     std::vector<LayerBase::WaitSemaphore> get_wait_semaphores() const override;
@@ -118,9 +137,11 @@ private:
     // a freshly-published slot to `in_use_`.
     static constexpr uint8_t kSlotNone = 0xFF;
 
-    // Picks a slot that is neither latest_ nor in_use_, in
-    // 0..kSlotCount-1. Returns a value < kSlotCount.
-    uint8_t pick_free_slot(uint8_t latest, uint8_t in_use) const noexcept;
+    // Picks a slot that is neither latest_ nor in any in_use_ entry.
+    // Returns kSlotNone if every slot is forbidden (producer outran the
+    // renderer beyond the sizing invariant) — caller drops the publish.
+    uint8_t pick_free_slot(uint8_t latest,
+                           const std::array<std::atomic<uint8_t>, kMaxFramesInFlight>& in_use) const noexcept;
 
     const VkContext* ctx_ = nullptr;
     VkRenderPass render_pass_ = VK_NULL_HANDLE; // borrowed from compositor
@@ -138,11 +159,24 @@ private:
     // One descriptor set per slot — record() binds the one for in_use_.
     std::array<VkDescriptorSet, kSlotCount> descriptor_sets_{};
 
-    // Mailbox: latest_ = most recent publish, in_use_ = slot the renderer
-    // is sampling. Atomic so producer and renderer share without locks.
-    // Both kSlotNone until the first submit() / first sampling record().
+    // Mailbox: latest_ = most recent publish. in_use_[i] = slot the
+    // i-th in-flight frame is sampling. Atomic so producer and
+    // renderer share without locks. All kSlotNone until first
+    // submit() / first sampling record(). Both record() and
+    // get_wait_semaphores() use the LAST seen in_use_ slot (any
+    // entry — record updates one, get_wait_semaphores reads from
+    // whichever entry corresponds to the in-flight frame that just
+    // recorded).
     std::atomic<uint8_t> latest_{ kSlotNone };
-    std::atomic<uint8_t> in_use_{ kSlotNone };
+    std::array<std::atomic<uint8_t>, kMaxFramesInFlight> in_use_{};
+    // Tracks which in_use_ entry was MOST RECENTLY promoted by
+    // record(). get_wait_semaphores() reads this entry's slot — it's
+    // the one whose cuda_done_writing semaphore gates the GPU's
+    // sampling work that was just queued. Atomic but doesn't need
+    // mutual exclusion with in_use_ stores (the renderer thread does
+    // both writes; we use atomics for cross-thread visibility with
+    // submit's reads in pick_free_slot).
+    std::atomic<uint8_t> last_in_use_slot_{ kSlotNone };
 
     // Live placement; lock for set_placement / record() snapshot.
     mutable std::mutex placement_mutex_;

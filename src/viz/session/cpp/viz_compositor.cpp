@@ -57,7 +57,17 @@ void VizCompositor::init()
 {
     try
     {
-        frame_sync_ = FrameSync::create(*ctx_);
+        // One FrameSync + command buffer per backend image slot.
+        const uint32_t n = backend_->image_count();
+        if (n == 0)
+        {
+            throw std::runtime_error("VizCompositor: backend->image_count() returned 0");
+        }
+        frame_syncs_.reserve(n);
+        for (uint32_t i = 0; i < n; ++i)
+        {
+            frame_syncs_.push_back(FrameSync::create(*ctx_));
+        }
         create_command_pool();
         create_command_buffer();
         if (config_.gpu_timing)
@@ -71,7 +81,8 @@ void VizCompositor::init()
                 VkQueryPoolCreateInfo qpci{};
                 qpci.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
                 qpci.queryType = VK_QUERY_TYPE_TIMESTAMP;
-                qpci.queryCount = 4;
+                // 4 timestamps per in-flight slot, indexed by slot.
+                qpci.queryCount = 4u * n;
                 check_vk(vkCreateQueryPool(ctx_->device(), &qpci, nullptr, &gpu_timestamp_pool_),
                          "vkCreateQueryPool(timestamps)");
             }
@@ -95,19 +106,26 @@ void VizCompositor::destroy()
     {
         return;
     }
+    // render() returns without host-waiting, so the command buffers /
+    // query pool may still be PENDING when destroy() is called. Drain
+    // before freeing — vkDestroyCommandPool on a PENDING buffer is UB.
+    // ensure_slot_count_matches_backend already drains via per-fence
+    // waits; here we use the device-wide hammer because destroy() runs
+    // in paths (dtor, init catch) where the per-fence path is fragile.
+    (void)vkDeviceWaitIdle(device);
     if (command_pool_ != VK_NULL_HANDLE)
     {
         // Pool destruction frees all command buffers allocated from it.
         vkDestroyCommandPool(device, command_pool_, nullptr);
         command_pool_ = VK_NULL_HANDLE;
-        command_buffer_ = VK_NULL_HANDLE;
+        command_buffers_.clear();
     }
     if (gpu_timestamp_pool_ != VK_NULL_HANDLE)
     {
         vkDestroyQueryPool(device, gpu_timestamp_pool_, nullptr);
         gpu_timestamp_pool_ = VK_NULL_HANDLE;
     }
-    frame_sync_.reset();
+    frame_syncs_.clear();
 }
 
 void VizCompositor::create_command_pool()
@@ -121,49 +139,58 @@ void VizCompositor::create_command_pool()
 
 void VizCompositor::create_command_buffer()
 {
+    // One command buffer per in-flight slot.
+    const uint32_t n = static_cast<uint32_t>(frame_syncs_.size());
+    command_buffers_.assign(n, VK_NULL_HANDLE);
     VkCommandBufferAllocateInfo info{};
     info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
     info.commandPool = command_pool_;
     info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    info.commandBufferCount = 1;
-    check_vk(vkAllocateCommandBuffers(ctx_->device(), &info, &command_buffer_), "vkAllocateCommandBuffers");
+    info.commandBufferCount = n;
+    check_vk(vkAllocateCommandBuffers(ctx_->device(), &info, command_buffers_.data()), "vkAllocateCommandBuffers");
 }
 
-void VizCompositor::submit_or_signal_fence(const VkSubmitInfo& info, const char* what)
+void VizCompositor::ensure_slot_count_matches_backend()
 {
-    const VkResult r = vkQueueSubmit(ctx_->queue(), 1, &info, frame_sync_->in_flight_fence());
+    const uint32_t want = backend_->image_count();
+    if (want == 0)
+    {
+        throw std::runtime_error("VizCompositor: backend->image_count() returned 0");
+    }
+    if (want == frame_syncs_.size())
+    {
+        return;
+    }
+    // Backend image_count changed under us — typically a WindowBackend
+    // swapchain recreate that returned a different count. Drain any
+    // in-flight work first; without this, destroy() would free fences
+    // / command buffers still in PENDING state on the GPU.
+    for (auto& fs : frame_syncs_)
+    {
+        if (fs != nullptr)
+        {
+            fs->wait();
+        }
+    }
+    destroy();
+    init();
+}
+
+void VizCompositor::submit_or_signal_fence(const VkSubmitInfo& info, const char* what, VkFence fence)
+{
+    const VkResult r = vkQueueSubmit(ctx_->queue(), 1, &info, fence);
     if (r == VK_SUCCESS)
     {
         return;
     }
     VkSubmitInfo empty{};
     empty.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    (void)vkQueueSubmit(ctx_->queue(), 1, &empty, frame_sync_->in_flight_fence());
+    (void)vkQueueSubmit(ctx_->queue(), 1, &empty, fence);
     throw std::runtime_error(std::string("VizCompositor: ") + what + " failed: VkResult=" + std::to_string(r));
 }
 
 void VizCompositor::render(const std::vector<LayerBase*>& layers)
 {
-    // Wait for previous frame (1 frame in flight).
-    frame_sync_->wait();
-
-    // Leave the command buffer in INITIAL on every exit path —
-    // pump_events() between renders may destroy framebuffer attachments,
-    // which Vulkan forbids while a cmd buffer referencing them is
-    // RECORDING/EXECUTABLE/PENDING. The trailing fence wait below
-    // guarantees we're never PENDING here.
-    struct CmdResetGuard
-    {
-        VkCommandBuffer cmd;
-        ~CmdResetGuard()
-        {
-            if (cmd != VK_NULL_HANDLE)
-            {
-                (void)vkResetCommandBuffer(cmd, 0);
-            }
-        }
-    } cmd_guard{ command_buffer_ };
-
     // Snapshot visible layers once — is_visible() is atomic, and
     // reading it twice could record a draw without the matching wait.
     std::vector<LayerBase*> visible_layers;
@@ -179,13 +206,79 @@ void VizCompositor::render(const std::vector<LayerBase*>& layers)
     auto frame = backend_->begin_frame(/*predicted_display_time=*/0);
     if (!frame.has_value())
     {
-        // Backend skipped; fence stays signaled, next wait() won't deadlock.
+        // Backend skipped; all fences stay signaled, next wait() won't deadlock.
         return;
     }
 
-    // On unwind, call abort_frame instead of end_frame: end_frame's
-    // present would wait on signal_after_render which our submit may
-    // never have signaled. abort_frame is the backend's recovery hook.
+    // Catch swapchain recreates whose image_count differs from the one
+    // we sized per-slot state for. Runs AFTER begin_frame because
+    // WindowBackend::begin_frame may itself recreate (OUT_OF_DATE etc.).
+    // Wrapped so a failed rebuild balances the backend protocol — we've
+    // already acquired a swapchain image and FrameGuard isn't set up
+    // yet, so a raw throw would leak the acquire.
+    try
+    {
+        ensure_slot_count_matches_backend();
+    }
+    catch (...)
+    {
+        try
+        {
+            backend_->abort_frame(*frame);
+        }
+        catch (...)
+        {
+        }
+        throw;
+    }
+
+    // Slot for the in-flight resources (fence, cmd buf, timestamp range).
+    const uint32_t slot_count = static_cast<uint32_t>(frame_syncs_.size());
+    if (slot_count == 0)
+    {
+        // ensure_slot_count_matches_backend either set this to >= 1 or
+        // threw; reaching here means logic drift. Bail rather than UB.
+        try
+        {
+            backend_->abort_frame(*frame);
+        }
+        catch (...)
+        {
+        }
+        throw std::runtime_error("VizCompositor: slot_count == 0 after ensure_slot_count_matches_backend");
+    }
+    const uint32_t slot = static_cast<uint32_t>(frame->backend_token) % slot_count;
+    FrameSync& slot_sync = *frame_syncs_[slot];
+    VkCommandBuffer command_buffer = command_buffers_[slot];
+
+    // Wait on THIS slot's fence — gates cmd-buffer reuse. Usually
+    // already signaled in multi-in-flight; backpressure when the host
+    // outruns the GPU.
+    slot_sync.wait();
+
+    // After ONE_TIME_SUBMIT + completion the buffer is in the "invalid"
+    // state per the Vulkan spec. The pool has RESET_COMMAND_BUFFER_BIT
+    // so vkBeginCommandBuffer below would implicitly reset, but we make
+    // it explicit so the lifecycle isn't load-bearing on that nuance.
+    check_vk(vkResetCommandBuffer(command_buffer, 0), "vkResetCommandBuffer");
+
+    // Reset on unwind before submit. After submit the cmd buffer is
+    // PENDING — releasing the guard prevents an illegal reset.
+    struct CmdResetGuard
+    {
+        VkCommandBuffer cmd;
+        bool released = false;
+        ~CmdResetGuard()
+        {
+            if (cmd != VK_NULL_HANDLE && !released)
+            {
+                (void)vkResetCommandBuffer(cmd, 0);
+            }
+        }
+    } cmd_guard{ command_buffer };
+
+    // On unwind, abort_frame instead of end_frame — the present's
+    // wait on signal_after_render may never have been signaled.
     struct FrameGuard
     {
         DisplayBackend* backend;
@@ -209,10 +302,8 @@ void VizCompositor::render(const std::vector<LayerBase*>& layers)
     const RenderTarget& rt = backend_->render_target();
     const Resolution rt_extent = rt.resolution();
 
-    // XR: per-eye viewports already set in frame->views by XrBackend.
-    // tile_layout / scissor / view[0] override are window-only
-    // letterboxing — applying them in XR collapses both eyes into one
-    // tile.
+    // XR: per-eye viewports come from frame->views. tile layout is
+    // window/offscreen letterboxing only.
     const bool xr_mode = backend_->is_xr();
 
     // Per-layer aspect-fit tiles (window/offscreen only).
@@ -232,14 +323,14 @@ void VizCompositor::render(const std::vector<LayerBase*>& layers)
     VkCommandBufferBeginInfo begin{};
     begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    check_vk(vkBeginCommandBuffer(command_buffer_, &begin), "vkBeginCommandBuffer");
+    check_vk(vkBeginCommandBuffer(command_buffer, &begin), "vkBeginCommandBuffer");
 
-    // ts0: cmd-buffer-begin. vkCmdResetQueryPool is the spec-compliant
-    // reset (some drivers reset implicitly, but don't rely on it).
+    // ts0: cmd-buffer-begin. Each slot owns query range [4*slot, 4*slot+4).
+    const uint32_t query_base = 4u * slot;
     if (gpu_timestamp_pool_ != VK_NULL_HANDLE)
     {
-        vkCmdResetQueryPool(command_buffer_, gpu_timestamp_pool_, 0, 4);
-        vkCmdWriteTimestamp(command_buffer_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, gpu_timestamp_pool_, 0);
+        vkCmdResetQueryPool(command_buffer, gpu_timestamp_pool_, query_base, 4);
+        vkCmdWriteTimestamp(command_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, gpu_timestamp_pool_, query_base + 0);
     }
 
     std::array<VkClearValue, 2> clears{};
@@ -255,15 +346,14 @@ void VizCompositor::render(const std::vector<LayerBase*>& layers)
     rp.clearValueCount = static_cast<uint32_t>(clears.size());
     rp.pClearValues = clears.data();
 
-    vkCmdBeginRenderPass(command_buffer_, &rp, VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdBeginRenderPass(command_buffer, &rp, VK_SUBPASS_CONTENTS_INLINE);
 
-    // Window/offscreen: pre-bind scissor=tile.outer and override
-    // view[0].viewport=tile.content for aspect-fit letterboxing.
-    // XR: per-eye viewports come from frame->views.
+    // Window/offscreen: scissor=tile.outer + view[0].viewport=tile.content
+    // for aspect-fit letterboxing.
     if (xr_mode)
     {
         const VkRect2D rt_full{ { 0, 0 }, { rt_extent.width, rt_extent.height } };
-        vkCmdSetScissor(command_buffer_, 0, 1, &rt_full);
+        vkCmdSetScissor(command_buffer, 0, 1, &rt_full);
     }
     for (size_t i = 0; i < visible_layers.size(); ++i)
     {
@@ -276,35 +366,35 @@ void VizCompositor::render(const std::vector<LayerBase*>& layers)
         {
             const VkRect2D scissor_rect = tiles[i].outer;
             const VkRect2D viewport_rect = tiles[i].content;
-            vkCmdSetScissor(command_buffer_, 0, 1, &scissor_rect);
+            vkCmdSetScissor(command_buffer, 0, 1, &scissor_rect);
             layer_views[0].viewport = to_rect2d(viewport_rect);
         }
-        visible_layers[i]->record(command_buffer_, layer_views, rt);
+        visible_layers[i]->record(command_buffer, layer_views, rt, slot);
     }
 
-    vkCmdEndRenderPass(command_buffer_);
+    vkCmdEndRenderPass(command_buffer);
 
     // ts1: end of render pass.
     if (gpu_timestamp_pool_ != VK_NULL_HANDLE)
     {
-        vkCmdWriteTimestamp(command_buffer_, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, gpu_timestamp_pool_, 1);
+        vkCmdWriteTimestamp(command_buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, gpu_timestamp_pool_, query_base + 1);
     }
 
-    backend_->record_post_render_pass(command_buffer_, *frame);
+    backend_->record_post_render_pass(command_buffer, *frame);
 
     // ts2: end of backend post-pass (ts2-ts1 = blit/transition cost).
     if (gpu_timestamp_pool_ != VK_NULL_HANDLE)
     {
-        vkCmdWriteTimestamp(command_buffer_, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, gpu_timestamp_pool_, 2);
+        vkCmdWriteTimestamp(command_buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, gpu_timestamp_pool_, query_base + 2);
     }
 
     // ts3: cmd-buffer-end (total = ts3-ts0).
     if (gpu_timestamp_pool_ != VK_NULL_HANDLE)
     {
-        vkCmdWriteTimestamp(command_buffer_, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, gpu_timestamp_pool_, 3);
+        vkCmdWriteTimestamp(command_buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, gpu_timestamp_pool_, query_base + 3);
     }
 
-    check_vk(vkEndCommandBuffer(command_buffer_), "vkEndCommandBuffer");
+    check_vk(vkEndCommandBuffer(command_buffer), "vkEndCommandBuffer");
 
     // Layer timeline waits + backend binary wait_before_render (value=0).
     std::vector<VkSemaphore> wait_semaphores;
@@ -348,27 +438,28 @@ void VizCompositor::render(const std::vector<LayerBase*>& layers)
     submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submit.pNext = &timeline;
     submit.commandBufferCount = 1;
-    submit.pCommandBuffers = &command_buffer_;
+    submit.pCommandBuffers = &command_buffer;
     submit.waitSemaphoreCount = static_cast<uint32_t>(wait_semaphores.size());
     submit.pWaitSemaphores = wait_semaphores.empty() ? nullptr : wait_semaphores.data();
     submit.pWaitDstStageMask = wait_stages.empty() ? nullptr : wait_stages.data();
     submit.signalSemaphoreCount = static_cast<uint32_t>(signal_semaphores.size());
     submit.pSignalSemaphores = signal_semaphores.empty() ? nullptr : signal_semaphores.data();
 
-    // Reset fence immediately before submit so any throw above leaves
-    // it signaled from the previous frame (next wait() won't deadlock).
-    frame_sync_->reset();
-    submit_or_signal_fence(submit, "vkQueueSubmit");
+    // Reset before submit so the signal lands on an unsignaled fence.
+    // On throw earlier, fence stays signaled — next render into this
+    // slot won't deadlock at wait().
+    slot_sync.reset();
+    submit_or_signal_fence(submit, "vkQueueSubmit", slot_sync.in_flight_fence());
+    cmd_guard.released = true;
 
-    // Drain before end_frame: keeps the cmd buffer EXECUTABLE (not
-    // PENDING) if end_frame throws. QuadLayer's mailbox depends on
-    // this synchronous-frame contract — see quad_layer.hpp.
-    frame_sync_->wait();
-
+    // No trailing host wait — the slot's fence is gated by the next
+    // render that targets this slot. GPU timing forces a synchronous
+    // wait to read query results; opt-in only.
     if (gpu_timestamp_pool_ != VK_NULL_HANDLE)
     {
+        slot_sync.wait();
         uint64_t ts[4] = { 0, 0, 0, 0 };
-        const VkResult r = vkGetQueryPoolResults(ctx_->device(), gpu_timestamp_pool_, 0, 4, sizeof(ts), ts,
+        const VkResult r = vkGetQueryPoolResults(ctx_->device(), gpu_timestamp_pool_, query_base, 4, sizeof(ts), ts,
                                                  sizeof(uint64_t), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
         if (r == VK_SUCCESS)
         {

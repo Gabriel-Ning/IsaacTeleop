@@ -26,7 +26,7 @@ class VizCompositor
 public:
     struct Config
     {
-        VkClearColorValue clear_color{ { 0.0f, 0.0f, 0.0f, 1.0f } };
+        VkClearColorValue clear_color{ { 0.0f, 0.0f, 0.0f, 0.0f } };
         // Opt-in GPU timestamp queries (4 per frame). Off by default so
         // production builds don't pay; read via last_gpu_timing() after
         // the frame's fence wait.
@@ -55,9 +55,14 @@ public:
     VizCompositor(VizCompositor&&) = delete;
     VizCompositor& operator=(VizCompositor&&) = delete;
 
-    // Records and submits one frame. Synchronous — waits for the
-    // frame's fence before returning (QuadLayer's mailbox depends on
-    // single-frame-in-flight; see quad_layer.hpp).
+    // Records and submits one frame. Multi-frame-in-flight: one
+    // FrameSync per backend image slot. render() waits on the slot's
+    // fence at entry (signaled by its previous use), submits with the
+    // same fence as signal target, and returns without host-waiting
+    // on completion. CPU pacing is the caller's responsibility — the
+    // window backend prefers MAILBOX (no vsync block), so a hot loop
+    // would burn a core; camera_viz drives this from an event-driven
+    // condition variable that wakes per producer publish.
     void render(const std::vector<LayerBase*>& layers);
 
     HostImage readback_to_host();
@@ -74,20 +79,29 @@ private:
     VizCompositor(const VkContext& ctx, DisplayBackend& backend, const Config& config);
     void init();
 
+    // Rebuild per-slot resources (fences, command buffers, timestamp
+    // query pool) when the backend's image_count() changes — typically
+    // after a window resize / swapchain recreate where the driver
+    // returns a different image count.
+    void ensure_slot_count_matches_backend();
+
     void create_command_pool();
     void create_command_buffer();
 
     // On submit failure, post an empty submit to signal the fence —
     // turns silent deadlock-on-next-wait into a throw here.
-    void submit_or_signal_fence(const VkSubmitInfo& info, const char* what);
+    void submit_or_signal_fence(const VkSubmitInfo& info, const char* what, VkFence fence);
 
     const VkContext* ctx_ = nullptr;
     DisplayBackend* backend_ = nullptr;
     Config config_{};
 
-    std::unique_ptr<FrameSync> frame_sync_;
+    // One FrameSync + command buffer per backend image slot, indexed
+    // by Frame::backend_token. Fences start signaled; the slot's fence
+    // wait at entry is exactly the "cmd buffer no longer PENDING" wait.
+    std::vector<std::unique_ptr<FrameSync>> frame_syncs_;
+    std::vector<VkCommandBuffer> command_buffers_;
     VkCommandPool command_pool_ = VK_NULL_HANDLE;
-    VkCommandBuffer command_buffer_ = VK_NULL_HANDLE;
 
     // 4 timestamps per frame: cb-begin / after-render / after-post / cb-end.
     // Only allocated when Config::gpu_timing is enabled.
