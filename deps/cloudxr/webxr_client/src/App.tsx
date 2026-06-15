@@ -229,13 +229,16 @@ function App() {
       // Disable button and show checking status
       cloudXR2DUI.setStartButtonState(true, 'CONNECT (checking capabilities)');
 
+      // Set by the IWER load effect above; passed to checkCapabilities to skip browser
+      // version checks that don't apply when running under a desktop XR emulator.
+      const iwerWasLoaded = sessionStorage.getItem('iwerWasLoaded') === 'true';
       let result: { success: boolean; failures: string[]; warnings: string[] } = {
         success: false,
         failures: [],
         warnings: [],
       };
       try {
-        result = await checkCapabilities();
+        result = await checkCapabilities(iwerWasLoaded);
       } catch (error) {
         cloudXR2DUI.showStatus(`Capability check error: ${error}`, 'error');
         setCapabilitiesValid(false);
@@ -255,7 +258,6 @@ function App() {
       }
 
       // Show final status message with IWER info if applicable
-      const iwerWasLoaded = sessionStorage.getItem('iwerWasLoaded') === 'true';
       if (result.warnings.length > 0) {
         cloudXR2DUI.showStatus('Performance notice:\n' + result.warnings.join('\n'), 'info');
       } else if (iwerWasLoaded) {
