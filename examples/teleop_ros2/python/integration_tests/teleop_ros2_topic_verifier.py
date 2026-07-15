@@ -15,6 +15,7 @@ from typing import Callable
 
 import msgpack
 import rclpy
+from constants import TELEOP_MODES
 from geometry_msgs.msg import PoseStamped, TwistStamped
 from isaacteleop.retargeting_engine.tensor_types.indices import HandJointIndex
 from rclpy.node import Node
@@ -24,7 +25,6 @@ from teleop_ros2_interfaces.msg import NamedPoseArray
 from tf2_msgs.msg import TFMessage
 
 
-_MODES = ("controller_teleop", "hand_teleop", "controller_raw", "full_body")
 _EXPECTED_TF_FRAMES = {"right_wrist", "left_wrist", "head"}
 _HAND_POSE_NAMES = [
     HandJointIndex(i).name
@@ -337,7 +337,7 @@ class TopicVerifier(Node):
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=_MODES, required=True)
+    parser.add_argument("--mode", choices=TELEOP_MODES, required=True)
     parser.add_argument("--timeout", type=float, default=20.0)
     return parser.parse_args()
 
